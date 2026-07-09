@@ -5,22 +5,41 @@
 GraphSAGE-based unsupervised clustering for scHi-C data.
 
 Reads a cell × bin feature matrix (output of preprocessing.py), applies TF-IDF
-+ StandardScaler, reduces with PCA, builds a kNN graph, trains a GraphSAGE
-encoder with NT-Xent contrastive loss, then clusters embeddings with Leiden.
++ StandardScaler, reduces with PCA / VAE / VQ-VAE, optionally fuses bin-index
+positional embeddings, builds a kNN graph, trains a GraphSAGE encoder with
+NT-Xent contrastive loss, then clusters embeddings with Leiden.
 
 No cell-type labels are required (default).  If labels are provided via
 --labels (CSV with [cell_id, label]) or --label_pkl (Higashi-style pickle
 with one of: 'major', 'cell type', 'cell_type', 'cluster label', 'label',
 'labels'), supervised metrics (NMI, ARI) and a confusion matrix are reported.
 
+Encoders:
+  --encoder pca     Linear PCA (default)
+  --encoder vae     Variational autoencoder (nonlinear, KL-regularised)
+  --encoder vqvae   Vector-quantised VAE (discrete codebook latent)
+
+Fusion:
+  --fuse-bin-indices --bin-indices-file hvb_selected_bins_100kb.csv
+  Concatenates positional embeddings of selected bin indices with the
+  encoder latent before kNN graph construction.
+
+Embed-only mode:
+  --embed-only   Stop after embedding (no GraphSAGE / Leiden).
+  Useful for comparing PCA vs VAE vs VQ-VAE latent spaces.
+
 Usage:
     python gnn_clustering.py --data matrix.csv --output-dir results/
     python gnn_clustering.py --data matrix.csv --output-dir results/ --labels labels.csv
     python gnn_clustering.py --data matrix.csv --output-dir results/ --label_pkl labels.pkl
+    python gnn_clustering.py --data matrix.csv --output-dir results/ --encoder vae --embed-only
+    python gnn_clustering.py --data matrix.csv --output-dir results/ --encoder vqvae \
+        --fuse-bin-indices --bin-indices-file hvb_selected_bins_100kb.csv
 """
 
 import argparse
 import copy
+import math
 import os
 import pickle
 import time
@@ -86,6 +105,41 @@ def parse_args():
                    help='Target number of clusters. If set, Leiden grid search only '
                         'considers clusterings within ±1 of this value. '
                         'If unset, all cluster counts are considered (default).')
+    # ─── Encoder / fusion options ───────────────────────────────────────────
+    p.add_argument('--encoder',  default='pca', choices=['pca', 'vae', 'vqvae'],
+                   help='Dimensionality reduction method (default: pca).')
+    p.add_argument('--vae-hidden-dim', type=int, default=256, metavar='INT',
+                   help='Hidden dim for VAE / VQ-VAE encoder (default: 256).')
+    p.add_argument('--vae-latent-dim', type=int, default=50, metavar='INT',
+                   help='Latent dim for VAE / VQ-VAE (replaces --pca-dim, default: 50).')
+    p.add_argument('--vae-epochs',     type=int, default=300, metavar='INT',
+                   help='Training epochs for VAE / VQ-VAE (default: 300).')
+    p.add_argument('--vae-lr',         type=float, default=1e-3, metavar='FLOAT',
+                   help='Learning rate for VAE / VQ-VAE (default: 1e-3).')
+    p.add_argument('--vae-beta',       type=float, default=1.0, metavar='FLOAT',
+                   help='KL divergence weight for VAE (default: 1.0).')
+    p.add_argument('--vqvae-n-embed',  type=int, default=512, metavar='INT',
+                   help='Codebook size for VQ-VAE (default: 512).')
+    p.add_argument('--vqvae-commitment', type=float, default=0.25, metavar='FLOAT',
+                   help='Commitment loss weight for VQ-VAE (default: 0.25).')
+    p.add_argument('--vqvae-ema',  action='store_true',
+                   help='Use EMA codebook update for VQ-VAE instead of gradient.')
+    p.add_argument('--vqvae-ema-decay', type=float, default=0.99, metavar='FLOAT',
+                   help='EMA decay for VQ-VAE codebook (default: 0.99).')
+    # ─── Fusion options ─────────────────────────────────────────────────────
+    p.add_argument('--fuse-bin-indices', action='store_true',
+                   help='Fuse bin-index positional embeddings with the encoder latent.')
+    p.add_argument('--bin-indices-file', default=None, metavar='CSV',
+                   help='CSV from preprocessing with [rank, original_index, bin_name, dispersion]. '
+                        'Required when --fuse-bin-indices is set.')
+    p.add_argument('--pos-embed-dim', type=int, default=16, metavar='INT',
+                   help='Dimension of the bin-index positional embedding (default: 16).')
+    p.add_argument('--pos-embed-mode', default='learned', choices=['learned', 'sinusoidal'],
+                   help='Positional embedding type for bin indices (default: learned).')
+    # ─── Embed-only mode ────────────────────────────────────────────────────
+    p.add_argument('--embed-only', action='store_true',
+                   help='Stop after embedding (no kNN graph, GraphSAGE, or Leiden). '
+                        'Useful for comparing PCA / VAE / VQ-VAE embeddings.')
     return p.parse_args()
 
 
@@ -131,6 +185,279 @@ def nt_xent_graph_loss(z, edge_index, tau=0.2, neg_sample_ratio=5):
     logits  = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
     targets = torch.zeros(logits.size(0), dtype=torch.long, device=z.device)
     return F.cross_entropy(logits, targets)
+
+
+# ─── VAE ENCODER ─────────────────────────────────────────────────────────────
+
+class VariationalAutoEncoder(nn.Module):
+    """Standard VAE with Gaussian latent.  Replaces PCA for nonlinear reduction."""
+
+    def __init__(self, in_dim, hidden_dim, latent_dim, dropout=0.1):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+        )
+        self.fc_mu  = nn.Linear(hidden_dim // 2, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim // 2, latent_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, in_dim),
+        )
+
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
+        return recon, mu, logvar, z
+
+
+def vae_loss(recon, x, mu, logvar, beta=1.0):
+    """Reconstruction (MSE) + KL divergence."""
+    recon_loss = F.mse_loss(recon, x, reduction='sum')
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return recon_loss + beta * kld, recon_loss.item(), kld.item()
+
+
+def train_vae(data, in_dim, hidden_dim, latent_dim, epochs, lr, beta,
+              device, seed=0, batch_size=256):
+    """Train a VAE and return (latent_embeddings, model, loss_history)."""
+    torch.manual_seed(seed)
+    model = VariationalAutoEncoder(in_dim, hidden_dim, latent_dim).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6)
+
+    x = torch.tensor(data, dtype=torch.float32).to(device)
+    n = x.size(0)
+    losses = []
+
+    model.train()
+    for epoch in range(epochs):
+        perm = torch.randperm(n, device=device)
+        epoch_loss = 0.0
+        for i in range(0, n, batch_size):
+            idx = perm[i:i + batch_size]
+            xb = x[idx]
+            optimizer.zero_grad()
+            recon, mu, logvar, z = model(xb)
+            loss, rl, kl = vae_loss(recon, xb, mu, logvar, beta=beta)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            epoch_loss += loss.item()
+        scheduler.step()
+        avg_loss = epoch_loss / n
+        losses.append(avg_loss)
+        if (epoch + 1) % 50 == 0:
+            print(f"    VAE Epoch {epoch+1:4d}/{epochs}  loss={avg_loss:.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        mu, _ = model.encode(x)
+        embeddings = mu.cpu().numpy().astype(np.float32)
+    return embeddings, model, losses
+
+
+# ─── VQ-VAE ENCODER ───────────────────────────────────────────────────────────
+
+class VectorQuantizer(nn.Module):
+    """Vector quantization layer with codebook, commitment loss, and optional EMA."""
+
+    def __init__(self, n_embed, embed_dim, commitment=0.25, ema=False, ema_decay=0.99):
+        super().__init__()
+        self.n_embed = n_embed
+        self.embed_dim = embed_dim
+        self.commitment = commitment
+        self.ema = ema
+        self.ema_decay = ema_decay
+        embed = torch.randn(n_embed, embed_dim)
+        self.register_buffer('embed', embed)
+        self.register_buffer('embed_avg', embed.clone())
+        self.register_buffer('cluster_size', torch.zeros(n_embed))
+
+    def forward(self, z):
+        # z: (B, D) -> find nearest codebook entry
+        dist = (z.unsqueeze(1) - self.embed.unsqueeze(0)).pow(2).sum(dim=2)
+        indices = dist.argmin(dim=1)
+        z_q = self.embed[indices]
+        # commitment loss
+        commit_loss = F.mse_loss(z_q.detach(), z) * self.commitment
+        codebook_loss = F.mse_loss(z_q, z.detach())
+        loss = commit_loss + codebook_loss
+        # straight-through estimator
+        z_q_st = z + (z_q - z).detach()
+        if self.ema and self.training:
+            one_hot = F.one_hot(indices, self.n_embed).type(z.dtype)
+            self.cluster_size.data.mul_(self.ema_decay).add_(
+                one_hot.sum(0), alpha=1 - self.ema_decay)
+            embed_sum = one_hot.t() @ z
+            self.embed_avg.data.mul_(self.ema_decay).add_(
+                embed_sum, alpha=1 - self.ema_decay)
+            n = self.cluster_size.unsqueeze(1)
+            self.embed.data.copy_(self.embed_avg / (n + 1e-6))
+        return z_q_st, loss, indices
+
+
+class VQVAEEncoder(nn.Module):
+    """VQ-VAE with discrete codebook latent.  Replaces PCA for nonlinear reduction."""
+
+    def __init__(self, in_dim, hidden_dim, latent_dim, n_embed=512,
+                 commitment=0.25, dropout=0.1, ema=False, ema_decay=0.99):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.vq = VectorQuantizer(n_embed, latent_dim, commitment, ema, ema_decay)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, in_dim),
+        )
+
+    def forward(self, x):
+        z_e = self.encoder(x)
+        z_q, vq_loss, indices = self.vq(z_e)
+        recon = self.decoder(z_q)
+        return recon, z_e, z_q, vq_loss, indices
+
+
+def train_vqvae(data, in_dim, hidden_dim, latent_dim, n_embed, commitment,
+                ema, ema_decay, epochs, lr, device, seed=0, batch_size=256):
+    """Train a VQ-VAE and return (latent_embeddings, model, loss_history)."""
+    torch.manual_seed(seed)
+    model = VQVAEEncoder(in_dim, hidden_dim, latent_dim, n_embed,
+                         commitment, ema=ema, ema_decay=ema_decay).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6)
+
+    x = torch.tensor(data, dtype=torch.float32).to(device)
+    n = x.size(0)
+    losses = []
+
+    model.train()
+    for epoch in range(epochs):
+        perm = torch.randperm(n, device=device)
+        epoch_loss = 0.0
+        for i in range(0, n, batch_size):
+            idx = perm[i:i + batch_size]
+            xb = x[idx]
+            optimizer.zero_grad()
+            recon, z_e, z_q, vq_loss, _ = model(xb)
+            recon_loss = F.mse_loss(recon, xb, reduction='sum')
+            loss = recon_loss + vq_loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            epoch_loss += loss.item()
+        scheduler.step()
+        avg_loss = epoch_loss / n
+        losses.append(avg_loss)
+        if (epoch + 1) % 50 == 0:
+            print(f"    VQ-VAE Epoch {epoch+1:4d}/{epochs}  loss={avg_loss:.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        z_e = model.encoder(x)
+        embeddings = z_e.cpu().numpy().astype(np.float32)
+    return embeddings, model, losses
+
+
+# ─── BIN-INDEX FUSION ─────────────────────────────────────────────────────────
+
+class BinIndexEmbedding(nn.Module):
+    """Positional embedding for bin indices.
+
+    Two modes:
+      - 'learned': nn.Embedding lookup (max_index + 1 entries)
+      - 'sinusoidal': fixed sinusoidal positional encoding (no learnable params)
+    """
+
+    def __init__(self, max_index, embed_dim, mode='learned'):
+        super().__init__()
+        self.mode = mode
+        self.embed_dim = embed_dim
+        if mode == 'learned':
+            self.embed = nn.Embedding(max_index + 1, embed_dim)
+        else:
+            self.register_buffer('pos_table',
+                                 _sinusoidal_table(max_index + 1, embed_dim))
+
+    def forward(self, indices):
+        if self.mode == 'learned':
+            return self.embed(indices)
+        else:
+            return self.pos_table[indices]
+
+
+def _sinusoidal_table(n, dim):
+    """Generate sinusoidal positional encoding table (n x dim)."""
+    pos = torch.arange(n).unsqueeze(1).float()
+    div = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+    table = torch.zeros(n, dim)
+    table[:, 0::2] = torch.sin(pos * div)
+    table[:, 1::2] = torch.cos(pos * div)
+    return table
+
+
+def load_bin_indices(csv_path):
+    """Load bin-index CSV from preprocessing. Returns array of original_index."""
+    df = pd.read_csv(csv_path)
+    return df['original_index'].to_numpy().astype(np.int64)
+
+
+def fuse_embeddings(latent, bin_indices, pos_embed_dim, mode, device, max_index=None):
+    """Fuse VAE/VQ-VAE latent with bin-index positional embeddings.
+
+    latent:      (n_cells, latent_dim) numpy
+    bin_indices: (n_bins,) numpy — original column indices of selected bins
+    Returns:     (n_cells, latent_dim + pos_embed_dim) numpy
+
+    The positional embedding is per-bin.  For each cell, we average the
+    positional embeddings across all selected bins (since the cell x bin
+    matrix has the same column ordering for every cell) and concatenate
+    with the cell's latent vector.
+    """
+    if max_index is None:
+        max_index = int(bin_indices.max())
+    indices_t = torch.tensor(bin_indices, dtype=torch.long).to(device)
+    embedder = BinIndexEmbedding(max_index, pos_embed_dim, mode).to(device)
+    with torch.no_grad():
+        pos_emb = embedder(indices_t)
+        pos_emb_avg = pos_emb.mean(dim=0, keepdim=True)
+        pos_expanded = pos_emb_avg.expand(latent.shape[0], -1)
+    fused = np.concatenate([latent, pos_expanded.cpu().numpy()], axis=1)
+    return fused.astype(np.float32)
 
 
 # ─── DATA ─────────────────────────────────────────────────────────────────────
@@ -389,6 +716,9 @@ def main():
     print("=" * 70)
     print(f"  Data       : {args.data}")
     print(f"  Output dir : {args.output_dir}")
+    print(f"  Encoder    : {args.encoder}")
+    print(f"  Fuse bins  : {args.fuse_bin_indices}")
+    print(f"  Embed only : {args.embed_only}")
     print(f"  Labels     : {args.labels or args.label_pkl or 'none (unsupervised mode)'}")
     print(f"  Device     : {DEVICE}")
     print(f"  Seed       : {args.seed}")
@@ -406,16 +736,92 @@ def main():
     else:
         print("  No labels — running fully unsupervised (silhouette objective).")
 
-    pca_dim = min(args.pca_dim, tfidf_ss.shape[0] - 1, tfidf_ss.shape[1])
-    print(f"\n[PCA] {tfidf_ss.shape[1]}D → {pca_dim}D...")
-    pca_model = PCA(n_components=pca_dim, random_state=args.seed)
-    X_pca     = pca_model.fit_transform(tfidf_ss).astype(np.float32)
-    print(f"  Cumulative var (top-{min(5, pca_dim)}): "
-          f"{pca_model.explained_variance_ratio_[:5].cumsum()[-1]:.1%}")
+    # ─── ENCODER ──────────────────────────────────────────────────────────────
+    encoder_losses = []
+    pca_model = None
+    vae_model = None
+    vqvae_model = None
 
+    if args.encoder == 'pca':
+        latent_dim = min(args.pca_dim, tfidf_ss.shape[0] - 1, tfidf_ss.shape[1])
+        print(f"\n[PCA] {tfidf_ss.shape[1]}D → {latent_dim}D...")
+        pca_model = PCA(n_components=latent_dim, random_state=args.seed)
+        X_latent = pca_model.fit_transform(tfidf_ss).astype(np.float32)
+        print(f"  Cumulative var (top-{min(5, latent_dim)}): "
+              f"{pca_model.explained_variance_ratio_[:5].cumsum()[-1]:.1%}")
+
+    elif args.encoder == 'vae':
+        latent_dim = args.vae_latent_dim
+        print(f"\n[VAE] {tfidf_ss.shape[1]}D → {latent_dim}D  "
+              f"hidden={args.vae_hidden_dim}  epochs={args.vae_epochs}  "
+              f"β={args.vae_beta}  lr={args.vae_lr}")
+        X_latent, vae_model, encoder_losses = train_vae(
+            tfidf_ss, tfidf_ss.shape[1], args.vae_hidden_dim, latent_dim,
+            args.vae_epochs, args.vae_lr, args.vae_beta,
+            DEVICE, seed=args.seed)
+        print(f"  Embeddings: {X_latent.shape}")
+
+    elif args.encoder == 'vqvae':
+        latent_dim = args.vae_latent_dim
+        print(f"\n[VQ-VAE] {tfidf_ss.shape[1]}D → {latent_dim}D  "
+              f"hidden={args.vae_hidden_dim}  codebook={args.vqvae_n_embed}  "
+              f"commit={args.vqvae_commitment}  ema={args.vqvae_ema}  "
+              f"epochs={args.vae_epochs}")
+        X_latent, vqvae_model, encoder_losses = train_vqvae(
+            tfidf_ss, tfidf_ss.shape[1], args.vae_hidden_dim, latent_dim,
+            args.vqvae_n_embed, args.vqvae_commitment,
+            args.vqvae_ema, args.vqvae_ema_decay,
+            args.vae_epochs, args.vae_lr,
+            DEVICE, seed=args.seed)
+        print(f"  Embeddings: {X_latent.shape}")
+
+    # ─── FUSION ───────────────────────────────────────────────────────────────
+    if args.fuse_bin_indices:
+        if not args.bin_indices_file:
+            raise ValueError("--bin-indices-file is required when --fuse-bin-indices is set")
+        print(f"\n[FUSION] Loading bin indices from {args.bin_indices_file}...")
+        bin_indices = load_bin_indices(args.bin_indices_file)
+        print(f"  {len(bin_indices)} bin indices, max={int(bin_indices.max())}")
+        print(f"  Pos embed: dim={args.pos_embed_dim}  mode={args.pos_embed_mode}")
+        X_latent = fuse_embeddings(
+            X_latent, bin_indices, args.pos_embed_dim,
+            args.pos_embed_mode, DEVICE)
+        print(f"  Fused shape: {X_latent.shape}")
+
+    # ─── EMBED-ONLY: save and exit ────────────────────────────────────────────
+    if args.embed_only:
+        elapsed = time.time() - t0
+        np.save(f'{out_prefix}_embeddings.npy', X_latent)
+        if encoder_losses:
+            plot_loss_curve(encoder_losses, out_prefix)
+        if pca_model is not None:
+            torch.save({'pca_model': pca_model,
+                        'config': {'encoder': 'pca', 'latent_dim': latent_dim}},
+                       f'{out_prefix}_model.pth')
+        elif vae_model is not None:
+            torch.save({'model_state_dict': vae_model.state_dict(),
+                        'config': {'encoder': 'vae', 'latent_dim': latent_dim,
+                                   'hidden_dim': args.vae_hidden_dim,
+                                   'beta': args.vae_beta}},
+                       f'{out_prefix}_model.pth')
+        elif vqvae_model is not None:
+            torch.save({'model_state_dict': vqvae_model.state_dict(),
+                        'config': {'encoder': 'vqvae', 'latent_dim': latent_dim,
+                                   'hidden_dim': args.vae_hidden_dim,
+                                   'n_embed': args.vqvae_n_embed}},
+                       f'{out_prefix}_model.pth')
+        print(f"\n[EMBED-ONLY] Saved embeddings {X_latent.shape} in {elapsed:.0f}s")
+        print(f"  {out_prefix}_embeddings.npy")
+        if encoder_losses:
+            print(f"  {out_prefix}_loss.png")
+        print(f"  {out_prefix}_model.pth")
+        print("=" * 70)
+        return
+
+    # ─── GRAPH + GraphSAGE + Leiden (full pipeline) ───────────────────────────
     k_graph = min(args.k_graph, len(cell_ids) - 1)
     print(f"\n[GRAPH] Building kNN graph (k={k_graph})...")
-    A = kneighbors_graph(X_pca, n_neighbors=k_graph, mode='connectivity',
+    A = kneighbors_graph(X_latent, n_neighbors=k_graph, mode='connectivity',
                          include_self=False, n_jobs=-1)
     A = A + A.T
     A[A > 1] = 1
@@ -423,10 +829,11 @@ def main():
     edge_index = torch.tensor(np.array([rows, cols]), dtype=torch.long).to(DEVICE)
     print(f"  {edge_index.size(1):,} edges")
 
-    print(f"\n[TRAIN] GraphSAGE  {pca_dim}→{args.hidden_dim}→{args.out_dim}  "
+    gnn_in_dim = X_latent.shape[1]
+    print(f"\n[TRAIN] GraphSAGE  {gnn_in_dim}→{args.hidden_dim}→{args.out_dim}  "
           f"layers={args.n_layers}  epochs={args.epochs}  τ={args.tau}")
-    x_tensor  = torch.tensor(X_pca, dtype=torch.float32).to(DEVICE)
-    model     = GraphSAGEEncoder(pca_dim, args.hidden_dim, args.out_dim,
+    x_tensor  = torch.tensor(X_latent, dtype=torch.float32).to(DEVICE)
+    model     = GraphSAGEEncoder(gnn_in_dim, args.hidden_dim, args.out_dim,
                                  args.n_layers, args.dropout).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -493,8 +900,12 @@ def main():
         print()
 
     # Save results
-    res_row = {'seed': args.seed, 'silhouette': best_sil,
+    res_row = {'seed': args.seed, 'encoder': args.encoder, 'silhouette': best_sil,
                'n_clusters': int(len(np.unique(best_pred))), 'config': best_tag}
+    if args.fuse_bin_indices:
+        res_row['fuse_bin_indices'] = True
+        res_row['pos_embed_dim'] = args.pos_embed_dim
+        res_row['pos_embed_mode'] = args.pos_embed_mode
     if true_labels is not None:
         res_row.update({'nmi': best_nmi, 'ari': best_ari})
     pd.DataFrame([res_row]).to_csv(f'{out_prefix}_results.csv', index=False)
@@ -506,14 +917,24 @@ def main():
 
     np.save(f'{out_prefix}_embeddings.npy', embeddings)
 
-    torch.save({
+    model_save = {
         'model_state_dict': model.state_dict(),
-        'pca_model':        pca_model,
-        'config': {'seed': args.seed, 'pca_dim': pca_dim, 'k_graph': k_graph,
+        'config': {'seed': args.seed, 'encoder': args.encoder,
+                   'latent_dim': latent_dim, 'gnn_in_dim': gnn_in_dim,
+                   'k_graph': k_graph,
                    'hidden_dim': args.hidden_dim, 'out_dim': args.out_dim}
-    }, f'{out_prefix}_model.pth')
+    }
+    if pca_model is not None:
+        model_save['pca_model'] = pca_model
+    if vae_model is not None:
+        model_save['vae_state_dict'] = vae_model.state_dict()
+    if vqvae_model is not None:
+        model_save['vqvae_state_dict'] = vqvae_model.state_dict()
+    torch.save(model_save, f'{out_prefix}_model.pth')
 
     print("\n[PLOTS] Generating visualizations...")
+    if encoder_losses:
+        plot_loss_curve(encoder_losses, f'{out_prefix}_encoder')
     plot_loss_curve(all_losses, out_prefix)
     nc_final = len(np.unique(best_pred))
     if nc_final >= 2:
@@ -528,6 +949,8 @@ def main():
     saved = [f'{out_prefix}_loss.png', f'{out_prefix}_results.csv',
              f'{out_prefix}_predictions.csv', f'{out_prefix}_embeddings.npy',
              f'{out_prefix}_model.pth']
+    if encoder_losses:
+        saved.append(f'{out_prefix}_encoder_loss.png')
     if nc_final >= 2:
         saved += [f'{out_prefix}_umap.png', f'{out_prefix}_pca.png',
                   f'{out_prefix}_silhouette.png']

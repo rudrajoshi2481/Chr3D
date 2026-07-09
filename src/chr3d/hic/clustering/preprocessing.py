@@ -162,7 +162,11 @@ def _parse_hvb_spec(spec):
 
 
 def _select_hvb_bins(norm_matrix, kind, value, coverage_filter=0.05):
-    """Return (mask, n_selected, stats) over the original bin axis."""
+    """Return (mask, n_selected, stats, selected_indices) over the original bin axis.
+
+    selected_indices is a 1-D array of original column positions, ordered by
+    descending dispersion (most variable first).
+    """
     n_bins  = norm_matrix.shape[1]
     bin_nz  = (norm_matrix > 0).mean(axis=0)
     cov_msk = bin_nz > coverage_filter
@@ -170,7 +174,7 @@ def _select_hvb_bins(norm_matrix, kind, value, coverage_filter=0.05):
     if n_after == 0:
         return np.zeros(n_bins, dtype=bool), 0, {
             'n_original_bins': n_bins, 'coverage_filter': coverage_filter,
-            'n_after_coverage': 0, 'n_selected': 0}
+            'n_after_coverage': 0, 'n_selected': 0}, np.array([], dtype=np.int64)
 
     sub  = norm_matrix[:, cov_msk]
     eps  = 1e-8
@@ -197,7 +201,33 @@ def _select_hvb_bins(norm_matrix, kind, value, coverage_filter=0.05):
         'n_selected':       int(mask.sum()),
         'dispersion_min':   float(disp[top_sub].min()),
         'dispersion_max':   float(disp[top_sub].max()),
+    }, pos
+
+
+# ---------------------------------------------------------------------------
+# Bin-index saving (for downstream fusion in gnn_clustering.py)
+# ---------------------------------------------------------------------------
+
+def _save_bin_indices(output_dir, resolution_str, selected_indices, col_names,
+                      disp_values=None):
+    """Save selected bin indices to a CSV for downstream positional embedding.
+
+    Columns: rank, original_index, bin_name, dispersion
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    idx_file = os.path.join(output_dir, f'hvb_selected_bins_{resolution_str}.csv')
+    n = len(selected_indices)
+    rows = {
+        'rank':            np.arange(1, n + 1, dtype=np.int32),
+        'original_index':  selected_indices.astype(np.int64),
+        'bin_name':        [col_names[i] for i in selected_indices],
     }
+    if disp_values is not None:
+        rows['dispersion'] = disp_values.astype(np.float32)
+    df = pl.DataFrame(rows)
+    df.write_csv(idx_file)
+    print(f"  [write] bin indices -> {idx_file} ({n} bins)")
+    return idx_file
 
 
 # ---------------------------------------------------------------------------
@@ -260,18 +290,27 @@ def _write_all_hvb_variants(base_output_dir, resolution_str, norm_matrix, int_da
         if kind == 'none':
             print(f"  [HVB:{tag}] keeping all {norm_matrix.shape[1]:,} bins")
             sel_norm, sel_int, sel_cols = norm_matrix, int_data, col_names
+            sel_indices = np.arange(norm_matrix.shape[1], dtype=np.int64)
             hvb_stats = {'hvb': tag,
                          'n_original_bins': int(norm_matrix.shape[1]),
                          'n_selected_bins': int(norm_matrix.shape[1])}
+            _save_bin_indices(sub_dir, resolution_str, sel_indices, col_names)
         else:
-            mask, n_sel, stats = _select_hvb_bins(norm_matrix, kind, value,
-                                                  coverage_filter=coverage_filter)
+            mask, n_sel, stats, sel_indices = _select_hvb_bins(
+                norm_matrix, kind, value, coverage_filter=coverage_filter)
             print(f"  [HVB:{tag}] coverage>{coverage_filter:.0%} -> "
                   f"{stats['n_after_coverage']:,} bins, selected top {n_sel:,}")
             sel_norm = norm_matrix[:, mask]
             sel_int  = int_data[:, mask]
             sel_cols = [col_names[i] for i in np.where(mask)[0]]
             hvb_stats = {'hvb': tag, 'hvb_kind': kind, 'hvb_value': value, **stats}
+            sub_for_disp = norm_matrix[:, mask]
+            eps = 1e-8
+            disp_vals = (sub_for_disp.var(axis=0) /
+                         (sub_for_disp.mean(axis=0) + eps)).astype(np.float32)
+            disp_ordered = disp_vals[np.argsort(disp_vals)[::-1]]
+            _save_bin_indices(sub_dir, resolution_str, sel_indices,
+                              col_names, disp_values=disp_ordered)
 
         outputs[tag] = _save_outputs(
             sub_dir, resolution_str, sel_norm, sel_int,
