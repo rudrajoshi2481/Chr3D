@@ -118,6 +118,9 @@ def parse_args():
                    help='Learning rate for VAE / VQ-VAE (default: 1e-3).')
     p.add_argument('--vae-beta',       type=float, default=1.0, metavar='FLOAT',
                    help='KL divergence weight for VAE (default: 1.0).')
+    p.add_argument('--vae-beta-warmup', type=int, default=0, metavar='INT',
+                   help='KL annealing warmup epochs for VAE (default: 0, no warmup). '
+                        'Beta is linearly ramped from 0 to --vae-beta over this many epochs.')
     p.add_argument('--vqvae-n-embed',  type=int, default=512, metavar='INT',
                    help='Codebook size for VQ-VAE (default: 512).')
     p.add_argument('--vqvae-commitment', type=float, default=0.25, metavar='FLOAT',
@@ -128,10 +131,13 @@ def parse_args():
                    help='EMA decay for VQ-VAE codebook (default: 0.99).')
     # ─── Fusion options ─────────────────────────────────────────────────────
     p.add_argument('--fuse-bin-indices', action='store_true',
-                   help='Fuse bin-index positional embeddings with the encoder latent.')
+                   help='Fuse bin-index positional embeddings with the encoder latent (post-encoder).')
+    p.add_argument('--pre-fuse-bin-indices', action='store_true',
+                   help='Concatenate bin-index positional encoding to input matrix BEFORE encoder. '
+                        'Adds pos_embed_dim columns of sinusoidal position encoding to the cell×bin matrix.')
     p.add_argument('--bin-indices-file', default=None, metavar='CSV',
                    help='CSV from preprocessing with [rank, original_index, bin_name, dispersion]. '
-                        'Required when --fuse-bin-indices is set.')
+                        'Required when --fuse-bin-indices or --pre-fuse-bin-indices is set.')
     p.add_argument('--pos-embed-dim', type=int, default=16, metavar='INT',
                    help='Dimension of the bin-index positional embedding (default: 16).')
     p.add_argument('--pos-embed-mode', default='learned', choices=['learned', 'sinusoidal'],
@@ -243,8 +249,12 @@ def vae_loss(recon, x, mu, logvar, beta=1.0):
 
 
 def train_vae(data, in_dim, hidden_dim, latent_dim, epochs, lr, beta,
-              device, seed=0, batch_size=256):
-    """Train a VAE and return (latent_embeddings, model, loss_history)."""
+              device, seed=0, batch_size=256, beta_warmup=0):
+    """Train a VAE and return (latent_embeddings, model, loss_history, loss_dict).
+
+    KL annealing: beta is linearly ramped from 0 to ``beta`` over the first
+    ``beta_warmup`` epochs to prevent posterior collapse.
+    """
     torch.manual_seed(seed)
     model = VariationalAutoEncoder(in_dim, hidden_dim, latent_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -254,32 +264,49 @@ def train_vae(data, in_dim, hidden_dim, latent_dim, epochs, lr, beta,
     x = torch.tensor(data, dtype=torch.float32).to(device)
     n = x.size(0)
     losses = []
+    recon_losses = []
+    kl_losses = []
 
     model.train()
     for epoch in range(epochs):
+        if beta_warmup > 0 and epoch < beta_warmup:
+            cur_beta = beta * (epoch + 1) / beta_warmup
+        else:
+            cur_beta = beta
+
         perm = torch.randperm(n, device=device)
         epoch_loss = 0.0
+        epoch_recon = 0.0
+        epoch_kl = 0.0
         for i in range(0, n, batch_size):
             idx = perm[i:i + batch_size]
             xb = x[idx]
             optimizer.zero_grad()
             recon, mu, logvar, z = model(xb)
-            loss, rl, kl = vae_loss(recon, xb, mu, logvar, beta=beta)
+            loss, rl, kl = vae_loss(recon, xb, mu, logvar, beta=cur_beta)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             epoch_loss += loss.item()
+            epoch_recon += rl
+            epoch_kl += kl
         scheduler.step()
         avg_loss = epoch_loss / n
+        avg_recon = epoch_recon / n
+        avg_kl = epoch_kl / n
         losses.append(avg_loss)
+        recon_losses.append(avg_recon)
+        kl_losses.append(avg_kl)
         if (epoch + 1) % 50 == 0:
-            print(f"    VAE Epoch {epoch+1:4d}/{epochs}  loss={avg_loss:.4f}")
+            print(f"    VAE Epoch {epoch+1:4d}/{epochs}  loss={avg_loss:.4f}  "
+                  f"recon={avg_recon:.4f}  kl={avg_kl:.4f}  beta={cur_beta:.4f}")
 
     model.eval()
     with torch.no_grad():
         mu, _ = model.encode(x)
         embeddings = mu.cpu().numpy().astype(np.float32)
-    return embeddings, model, losses
+    loss_dict = {'total': losses, 'recon': recon_losses, 'kl': kl_losses}
+    return embeddings, model, losses, loss_dict
 
 
 # ─── VQ-VAE ENCODER ───────────────────────────────────────────────────────────
@@ -436,6 +463,33 @@ def load_bin_indices(csv_path):
     return df['original_index'].to_numpy().astype(np.int64)
 
 
+def pre_fuse_input(data, bin_indices, pos_embed_dim, max_index=None):
+    """Concatenate positional encoding to cell×bin matrix BEFORE encoder.
+
+    Creates a sinusoidal positional encoding for each bin, then computes
+    a single positional fingerprint per cell by taking the weighted average
+    of bin positional encodings (weighted by contact values). This gives
+    each cell a unique position-aware summary that reflects which genomic
+    regions it has high/low contacts in.
+
+    data:        (n_cells, n_bins) numpy
+    bin_indices: (n_bins,) numpy — original column indices
+    Returns:     (n_cells, n_bins + pos_embed_dim) numpy
+    """
+    if max_index is None:
+        max_index = int(bin_indices.max())
+    pos_table = _sinusoidal_table(max_index + 1, pos_embed_dim).numpy()
+    pos_cols = pos_table[bin_indices]          # (n_bins, pos_embed_dim)
+
+    # Weight each bin's positional encoding by the cell's contact values
+    # This gives each cell a unique pos fingerprint based on where its contacts are
+    weights = np.abs(data) + 1e-8              # (n_cells, n_bins)
+    weights = weights / weights.sum(axis=1, keepdims=True)  # normalize per cell
+    pos_per_cell = weights @ pos_cols          # (n_cells, pos_embed_dim)
+
+    return np.hstack([data, pos_per_cell.astype(data.dtype)])
+
+
 def fuse_embeddings(latent, bin_indices, pos_embed_dim, mode, device, max_index=None):
     """Fuse VAE/VQ-VAE latent with bin-index positional embeddings.
 
@@ -537,7 +591,7 @@ def cluster_leiden(embeddings, true_labels=None, n_clusters=None):
                 nc   = len(np.unique(pred))
                 if nc < 2:
                     continue
-                if n_clusters is not None and nc != n_clusters:
+                if n_clusters is not None and abs(nc - n_clusters) > 1:
                     continue
                 sil = silhouette_score(embeddings, pred)
                 if use_ari:
@@ -583,7 +637,13 @@ def plot_umap(embeddings, pred_labels, out_prefix, true_labels=None, label_names
         axes[0].scatter(umap_xy[m, 0], umap_xy[m, 1], c=[cmap(c)], s=10, alpha=0.7,
                         label=f'C{c} (n={m.sum()})', edgecolors='none')
     sil_str = f'sil={silhouette_score(embeddings, pred_labels):.3f}' if nc >= 2 else 'sil=n/a'
-    axes[0].set_title(f'Predicted clusters  ({sil_str})', fontsize=13, fontweight='bold')
+    if true_labels is not None and nc >= 2:
+        nmi_v = NMI(true_labels, pred_labels)
+        ari_v = ARI(true_labels, pred_labels)
+        title_str = f'Predicted clusters  ({sil_str}  NMI={nmi_v:.3f}  ARI={ari_v:.3f})'
+    else:
+        title_str = f'Predicted clusters  ({sil_str})'
+    axes[0].set_title(title_str, fontsize=13, fontweight='bold')
     axes[0].set_xlabel('UMAP-1');  axes[0].set_ylabel('UMAP-2')
     axes[0].legend(fontsize=8, frameon=True, markerscale=2)
 
@@ -622,7 +682,13 @@ def plot_pca(embeddings, pred_labels, out_prefix, true_labels=None, label_names=
             continue
         axes[0].scatter(pca_xy[m, 0], pca_xy[m, 1], c=[cmap(c)], s=10, alpha=0.7,
                         label=f'C{c} (n={m.sum()})', edgecolors='none')
-    axes[0].set_title('Predicted clusters', fontsize=13, fontweight='bold')
+    if true_labels is not None and nc >= 2:
+        nmi_v = NMI(true_labels, pred_labels)
+        ari_v = ARI(true_labels, pred_labels)
+        title_str = f'Predicted clusters  (NMI={nmi_v:.3f}  ARI={ari_v:.3f})'
+    else:
+        title_str = 'Predicted clusters'
+    axes[0].set_title(title_str, fontsize=13, fontweight='bold')
     axes[0].set_xlabel(f'PC1 ({pca2.explained_variance_ratio_[0]:.1%})')
     axes[0].set_ylabel(f'PC2 ({pca2.explained_variance_ratio_[1]:.1%})')
     axes[0].legend(fontsize=8, frameon=True, markerscale=2)
@@ -697,6 +763,25 @@ def plot_loss_curve(losses, out_prefix):
     plt.close(fig)
 
 
+def plot_vae_losses(loss_dict, out_prefix):
+    """Plot VAE training losses: total, reconstruction, and KL separately."""
+    epochs = range(1, len(loss_dict['total']) + 1)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+    for ax, key, color, title in zip(
+            axes,
+            ['total', 'recon', 'kl'],
+            ['steelblue', '#E07B39', '#6DBF8A'],
+            ['Total loss', 'Reconstruction loss', 'KL divergence']):
+        ax.plot(epochs, loss_dict[key], lw=1.5, color=color)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(title)
+        ax.set_title(title, fontsize=13, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(f'{out_prefix}_vae_losses.png', dpi=200,
+                bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -705,6 +790,23 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     out_prefix = os.path.join(args.output_dir, 'gnn_clustering')
+
+    # ─── FILE LOGGING ────────────────────────────────────────────────────────
+    import sys
+    log_path = os.path.join(args.output_dir, 'run.log')
+    class _Tee:
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+    _log_fh = open(log_path, 'w')
+    sys.stdout = _Tee(sys.stdout, _log_fh)
+    sys.stderr = _Tee(sys.stderr, _log_fh)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -718,6 +820,7 @@ def main():
     print(f"  Output dir : {args.output_dir}")
     print(f"  Encoder    : {args.encoder}")
     print(f"  Fuse bins  : {args.fuse_bin_indices}")
+    print(f"  Pre-fuse   : {args.pre_fuse_bin_indices}")
     print(f"  Embed only : {args.embed_only}")
     print(f"  Labels     : {args.labels or args.label_pkl or 'none (unsupervised mode)'}")
     print(f"  Device     : {DEVICE}")
@@ -736,6 +839,17 @@ def main():
     else:
         print("  No labels — running fully unsupervised (silhouette objective).")
 
+    # ─── PRE-ENCODER FUSION ──────────────────────────────────────────────────
+    if args.pre_fuse_bin_indices:
+        if not args.bin_indices_file:
+            raise ValueError("--bin-indices-file is required when --pre-fuse-bin-indices is set")
+        print(f"\n[PRE-FUSION] Loading bin indices from {args.bin_indices_file}...")
+        bin_indices = load_bin_indices(args.bin_indices_file)
+        print(f"  {len(bin_indices)} bin indices, max={int(bin_indices.max())}")
+        print(f"  Pos embed: dim={args.pos_embed_dim}  mode=sinusoidal")
+        tfidf_ss = pre_fuse_input(tfidf_ss, bin_indices, args.pos_embed_dim)
+        print(f"  Fused input shape: {tfidf_ss.shape}")
+
     # ─── ENCODER ──────────────────────────────────────────────────────────────
     encoder_losses = []
     pca_model = None
@@ -752,14 +866,20 @@ def main():
 
     elif args.encoder == 'vae':
         latent_dim = args.vae_latent_dim
+        warmup_str = f"  warmup={args.vae_beta_warmup}" if args.vae_beta_warmup > 0 else ""
         print(f"\n[VAE] {tfidf_ss.shape[1]}D → {latent_dim}D  "
               f"hidden={args.vae_hidden_dim}  epochs={args.vae_epochs}  "
-              f"β={args.vae_beta}  lr={args.vae_lr}")
-        X_latent, vae_model, encoder_losses = train_vae(
+              f"β={args.vae_beta}  lr={args.vae_lr}{warmup_str}")
+        X_latent, vae_model, encoder_losses, vae_loss_dict = train_vae(
             tfidf_ss, tfidf_ss.shape[1], args.vae_hidden_dim, latent_dim,
             args.vae_epochs, args.vae_lr, args.vae_beta,
-            DEVICE, seed=args.seed)
+            DEVICE, seed=args.seed, beta_warmup=args.vae_beta_warmup)
         print(f"  Embeddings: {X_latent.shape}")
+        final_kl = vae_loss_dict['kl'][-1]
+        final_recon = vae_loss_dict['recon'][-1]
+        print(f"  Final recon={final_recon:.4f}  kl={final_kl:.4f}")
+        if final_kl < 1.0:
+            print(f"  WARNING: KL={final_kl:.4f} is very low — possible posterior collapse")
 
     elif args.encoder == 'vqvae':
         latent_dim = args.vae_latent_dim
@@ -788,12 +908,14 @@ def main():
             args.pos_embed_mode, DEVICE)
         print(f"  Fused shape: {X_latent.shape}")
 
-    # ─── EMBED-ONLY: save and exit ────────────────────────────────────────────
+    # ─── EMBED-ONLY: save, cluster, plot, and exit ───────────────────────────
     if args.embed_only:
         elapsed = time.time() - t0
         np.save(f'{out_prefix}_embeddings.npy', X_latent)
         if encoder_losses:
             plot_loss_curve(encoder_losses, out_prefix)
+        if vae_model is not None:
+            plot_vae_losses(vae_loss_dict, out_prefix)
         if pca_model is not None:
             torch.save({'pca_model': pca_model,
                         'config': {'encoder': 'pca', 'latent_dim': latent_dim}},
@@ -802,7 +924,8 @@ def main():
             torch.save({'model_state_dict': vae_model.state_dict(),
                         'config': {'encoder': 'vae', 'latent_dim': latent_dim,
                                    'hidden_dim': args.vae_hidden_dim,
-                                   'beta': args.vae_beta}},
+                                   'beta': args.vae_beta,
+                                   'beta_warmup': args.vae_beta_warmup}},
                        f'{out_prefix}_model.pth')
         elif vqvae_model is not None:
             torch.save({'model_state_dict': vqvae_model.state_dict(),
@@ -810,13 +933,98 @@ def main():
                                    'hidden_dim': args.vae_hidden_dim,
                                    'n_embed': args.vqvae_n_embed}},
                        f'{out_prefix}_model.pth')
-        print(f"\n[EMBED-ONLY] Saved embeddings {X_latent.shape} in {elapsed:.0f}s")
+
+        # ── Leiden clustering on latent ──
+        print(f"\n[EMBED-ONLY] Leiden clustering on latent...")
+        best_pred, best_tag, best_nmi, best_ari, best_sil = cluster_leiden(
+            X_latent, true_labels, n_clusters=args.n_clusters)
+        if best_pred is None:
+            print("  WARNING: clustering failed — assigning all to cluster 0")
+            best_pred = np.zeros(len(cell_ids), dtype=int)
+
+        print(f"  Clusters    : {len(np.unique(best_pred))}")
+        print(f"  Silhouette  : {best_sil:.4f}")
+        if true_labels is not None:
+            print(f"  NMI         : {best_nmi:.4f}")
+            print(f"  ARI         : {best_ari:.4f}")
+        print(f"  Best config : {best_tag}")
+
+        # Save results & predictions
+        res_row = {'seed': args.seed, 'encoder': args.encoder,
+                   'silhouette': best_sil,
+                   'n_clusters': int(len(np.unique(best_pred))),
+                   'config': best_tag}
+        if true_labels is not None:
+            res_row.update({'nmi': best_nmi, 'ari': best_ari})
+        pd.DataFrame([res_row]).to_csv(f'{out_prefix}_results.csv', index=False)
+
+        pred_df = pd.DataFrame({'cell_id': cell_ids, 'cluster': best_pred})
+        if true_labels is not None:
+            pred_df['true_label'] = [label_names[l] for l in true_labels]
+        pred_df.to_csv(f'{out_prefix}_predictions.csv', index=False)
+
+        # Plots: UMAP + PCA with predicted & true labels
+        nc_final = len(np.unique(best_pred))
+        print("\n[EMBED-ONLY] Generating visualizations...")
+        plot_umap(X_latent, best_pred, out_prefix, true_labels, label_names)
+        plot_pca(X_latent, best_pred, out_prefix, true_labels, label_names)
+        if nc_final >= 2:
+            plot_silhouette(X_latent, best_pred, out_prefix)
+        if true_labels is not None:
+            plot_confusion(true_labels, best_pred, label_names, out_prefix)
+
+        print(f"\n[EMBED-ONLY] Done in {elapsed:.0f}s")
         print(f"  {out_prefix}_embeddings.npy")
         if encoder_losses:
             print(f"  {out_prefix}_loss.png")
+        if vae_model is not None:
+            print(f"  {out_prefix}_vae_losses.png")
         print(f"  {out_prefix}_model.pth")
+        print(f"  {out_prefix}_results.csv")
+        print(f"  {out_prefix}_predictions.csv")
+        print(f"  {out_prefix}_umap.png  {out_prefix}_pca.png")
+        if nc_final >= 2:
+            print(f"  {out_prefix}_silhouette.png")
+        if true_labels is not None:
+            print(f"  {out_prefix}_confusion.png")
         print("=" * 70)
         return
+
+    # ─── INTERMEDIATE CLUSTERING on encoder latent (before GraphSAGE) ────────
+    print("\n[CLUSTER-PRE] Leiden on encoder latent (before GraphSAGE)...")
+    pre_pred, pre_tag, pre_nmi, pre_ari, pre_sil = cluster_leiden(
+        X_latent, true_labels, n_clusters=args.n_clusters)
+    if pre_pred is None:
+        print("  WARNING: pre-GNN clustering failed — assigning all to cluster 0")
+        pre_pred = np.zeros(len(cell_ids), dtype=int)
+    print(f"  Clusters    : {len(np.unique(pre_pred))}")
+    print(f"  Silhouette  : {pre_sil:.4f}")
+    if true_labels is not None:
+        print(f"  NMI         : {pre_nmi:.4f}")
+        print(f"  ARI         : {pre_ari:.4f}")
+    print(f"  Best config : {pre_tag}")
+
+    # Save pre-GNN predictions and plots
+    pre_prefix = os.path.join(args.output_dir, 'pre_gnn')
+    pre_df = pd.DataFrame({'cell_id': cell_ids, 'cluster': pre_pred})
+    if true_labels is not None:
+        pre_df['true_label'] = [label_names[l] for l in true_labels]
+    pre_df.to_csv(f'{pre_prefix}_predictions.csv', index=False)
+    pre_res = {'stage': 'pre_gnn', 'encoder': args.encoder,
+               'silhouette': pre_sil,
+               'n_clusters': int(len(np.unique(pre_pred))), 'config': pre_tag}
+    if true_labels is not None:
+        pre_res.update({'nmi': pre_nmi, 'ari': pre_ari})
+    pd.DataFrame([pre_res]).to_csv(f'{pre_prefix}_results.csv', index=False)
+    if len(np.unique(pre_pred)) >= 2:
+        plot_umap(X_latent, pre_pred, pre_prefix, true_labels, label_names)
+        plot_pca(X_latent, pre_pred, pre_prefix, true_labels, label_names)
+        if true_labels is not None:
+            plot_confusion(true_labels, pre_pred, label_names, pre_prefix)
+        print(f"  Saved: {pre_prefix}_predictions.csv, {pre_prefix}_results.csv, "
+              f"{pre_prefix}_umap.png, {pre_prefix}_pca.png")
+        if true_labels is not None:
+            print(f"  {pre_prefix}_confusion.png")
 
     # ─── GRAPH + GraphSAGE + Leiden (full pipeline) ───────────────────────────
     k_graph = min(args.k_graph, len(cell_ids) - 1)
